@@ -111,6 +111,10 @@ xset -dpms
 # Hide mouse cursor after a delay
 unclutter -idle 0.5 &
 
+# Clear stale Chromium profile locks (can be left behind after an unclean
+# shutdown or a hostname change) so kiosk startup never silently fails.
+rm -f ~/.config/chromium/Singleton{Lock,Cookie,Socket}
+
 # Launch Chromium in kiosk mode
 # Replace YOUR_HOME_ASSISTANT_URL with the actual URL of your Lovelace dashboard
 # Example: http://homeassistant.local:8123/lovelace/main
@@ -247,7 +251,15 @@ EndSection
   see the error output.
 - **Chromium doesn't show the dashboard**: test the URL from a regular
   browser first, then run the `chromium --kiosk --app=...` command manually
-  in a terminal (via SSH + `DISPLAY=:0`) to see errors.
+  in a terminal (via SSH + `DISPLAY=:0`, plus
+  `XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1)`) to see errors.
+- **Chromium silently never launches (no process at all, X/openbox fine)**:
+  usually a stale `~/.config/chromium/SingletonLock` symlink (left over from
+  an unclean shutdown, or pointing at an old hostname/PID after a rename).
+  Chromium thinks another instance owns the profile and exits immediately;
+  `--noerrdialogs` hides the dialog so nothing visibly happens. Fix:
+  `rm ~/.config/chromium/Singleton{Lock,Cookie,Socket}` then relaunch. The
+  autostart script now does this automatically before every launch.
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
