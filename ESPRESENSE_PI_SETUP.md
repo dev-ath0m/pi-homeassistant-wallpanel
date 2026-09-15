@@ -161,7 +161,7 @@ Enrolled devices are stored separately in
 | `espresense/rooms/wohnzimmer/status` | yes | `online` / `offline` (Last Will) |
 | `espresense/rooms/wohnzimmer/name` | yes | `Wohnzimmer` |
 | `espresense/rooms/wohnzimmer/<setting>` | yes | current BLE setting value |
-| `espresense/rooms/wohnzimmer/telemetry` | no | uptime, free memory, CPU % (every 30 s) |
+| `espresense/rooms/wohnzimmer/telemetry` | no | `{"uptime","ver","firm","ip","rssi","freeMem","cpuPct"}` (every 30 s) |
 | `espresense/devices/<id>/wohnzimmer` | no | `{"id","distance","rssi","mac","name"}` |
 | `espresense/rooms/+/<setting>/set` | — | **subscribed**: change a setting at runtime |
 | `espresense/settings/<id>/config` | — | **subscribed**: device enrollment sync |
@@ -215,6 +215,29 @@ closest one. Enroll a device here under `/devices` using the same ID that
 your other ESPresense nodes use, so HA sees a single device reported by
 multiple rooms.
 
+### ESPresense Companion "Nodes" view
+
+If you also run ESPresense Companion, its **Nodes** table is built entirely
+from the room telemetry topic:
+
+| Column | Source |
+| --- | --- |
+| Version | telemetry `ver` |
+| IP | telemetry `ip` |
+| Flavor | first flavor in `types.json` whose `value` is a suffix of telemetry `firm` |
+| CPU | firmware entry named `<firm>.bin` in `types.json`, mapped to its CPU |
+
+Companion downloads that lookup table from
+<https://espresense.com/firmware/types.json>, which only lists the four
+ESP32 variants and their official firmware binaries. Because this node
+reports `firm: "rpi"` — which deliberately matches no ESP32 firmware — the
+**CPU column stays `n/a`** and **Flavor falls back to `Standard`**.
+
+That is intentional: claiming an ESP32 firmware name would make Companion
+offer OTA firmware updates and try to flash an ESP32 image onto a
+Raspberry Pi. The missing **Update** button on this node's row is the
+safety net working as designed.
+
 ## Maintenance
 
 ```bash
@@ -245,6 +268,8 @@ sudo journalctl -u espresense-pi -b -1 --no-pager   # previous boot
 
 | Symptom | Cause / fix |
 | --- | --- |
+| Companion's Nodes view shows `n/a` for Version/IP | The node isn't publishing `ver`/`ip` in its telemetry — check `mosquitto_sub -h 192.168.178.6 -v -t 'espresense/rooms/wohnzimmer/telemetry'` |
+| Companion's Nodes view shows `n/a` for CPU | Expected — Companion can only resolve the four ESP32 CPUs from the official firmware manifest (see above) |
 | HA shows the room **disconnected** but device messages keep arriving | Stale retained Last Will. The broker publishes `offline` only when it reaps the dead session, which can land *after* the client reconnected and published `online`. Fixed by re-asserting the retained `online` status on every telemetry tick — verify with `mosquitto_sub -h 192.168.178.6 -v -t 'espresense/rooms/wohnzimmer/status'` |
 | `MQTT disconnected rc=16` in the log | paho keepalive (30 s) timeout — a transient network hiccup or broker restart. Harmless if a reconnect line follows within seconds |
 | No devices detected at all | Adapter down or soft-blocked: `sudo rfkill unblock bluetooth && sudo hciconfig hci0 up` |
