@@ -24,7 +24,7 @@ Current state on this Pi:
 | Room name | `Wohnzimmer` (slug `wohnzimmer`) |
 | Install dir | `/opt/espresense-pi` |
 | Service | `espresense-pi.service` (enabled at boot, runs as `root`) |
-| Web UI | `http://192.168.178.20:8080` |
+| Web UI | `http://192.168.178.20` (port 80) |
 | MQTT broker | `192.168.178.6:1883` |
 | Bluetooth adapter | `hci0` (onboard, UART) |
 
@@ -33,7 +33,7 @@ flowchart LR
     A[BLE advertisements] --> B[bleak scanner<br/>hci0]
     B --> C[distance estimate<br/>RSSI + path loss]
     C --> D[espresense/devices/&lt;id&gt;/wohnzimmer]
-    C --> E[Flask web UI :8080]
+    C --> E[Flask web UI :80]
     D --> F[MQTT broker<br/>192.168.178.6]
     F --> G[Home Assistant<br/>ESPresense integration]
 ```
@@ -138,7 +138,7 @@ ble:
   count_ms: 10000
 web:
   host: 0.0.0.0
-  port: 8080
+  port: 80
 ```
 
 Enrolled devices are stored separately in
@@ -184,7 +184,7 @@ mosquitto_pub -h 192.168.178.6 -t 'espresense/rooms/wohnzimmer/absorption/set' -
 
 ## 5. Web UI
 
-`http://192.168.178.20:8080` — `/` redirects to `/network`. Pages:
+`http://192.168.178.20` — `/` redirects to `/network`. Pages:
 
 | Path | Purpose |
 | --- | --- |
@@ -195,12 +195,16 @@ mosquitto_pub -h 192.168.178.6 -t 'espresense/rooms/wohnzimmer/absorption/set' -
 | `/json/devices` | Current device list with distance, RSSI, last seen |
 
 There is **no authentication** on this UI, and it binds to `0.0.0.0`.
-Keep it on the trusted LAN only — never port-forward `8080`.
+Keep it on the trusted LAN only — never port-forward it.
+
+It listens on **port 80** rather than a high port on purpose: ESPresense
+Companion's *Visit* button links to `http://<ip>` with no port, so anything
+else produces a dead link.
 
 Quick health check from the shell:
 
 ```bash
-curl -s http://127.0.0.1:8080/json/devices | python3 -m json.tool
+curl -s http://127.0.0.1/json/devices | python3 -m json.tool
 ```
 
 ## 6. Home Assistant
@@ -235,8 +239,39 @@ reports `firm: "rpi"` — which deliberately matches no ESP32 firmware — the
 
 That is intentional: claiming an ESP32 firmware name would make Companion
 offer OTA firmware updates and try to flash an ESP32 image onto a
-Raspberry Pi. The missing **Update** button on this node's row is the
-safety net working as designed.
+Raspberry Pi.
+
+Companion renders the row's action buttons purely from telemetry, with no
+way to opt out per node:
+
+| Button | Shown when | Behaviour here |
+| --- | --- | --- |
+| Visit | `ip` is present | Links to `http://<ip>` with no port — hence the UI on port 80 |
+| Restart | any telemetry | Works: publishes `…/restart/set`, the node restarts |
+| Update | `ver` is present | Inert. Companion needs a CPU to pick a firmware and ours is `n/a`, so it fails with *"No firmware found for selected CPU"*; an `update/set` message is ignored by the node |
+
+So the **Update** button is unavoidable as long as the Version column is
+wanted — pressing it cannot flash anything.
+
+### Device IDs
+
+The node fingerprints advertisements with the same rules as
+`BleFingerprint.cpp` in the ESP32 firmware, so both node types publish the
+same id for the same device and Companion can trilaterate across rooms:
+
+| Id | Source |
+| --- | --- |
+| `<mac>` | public or static-random address with nothing better |
+| `irk:<hex>` / enrolled alias | resolvable private address matched against an enrolled IRK |
+| `known:<mac>` | address matched a `known_macs` prefix |
+| `name:<kebab-name>` | advertised local name |
+| `ad:<uuids>` / `sd:<uuids>` | advertised service UUIDs / service data UUIDs |
+| `md:<company>:<len>` | manufacturer data |
+| `iBeacon:<uuid>-<major>-<minor>` | iBeacon payload |
+| `apple:…`, `msft:cdp:…`, `tile:…`, `samsung:…`, … | vendor-specific payloads |
+
+Each candidate carries the firmware's priority and the strongest one wins,
+so e.g. an iBeacon payload outranks a bare MAC.
 
 ## Maintenance
 
@@ -270,6 +305,9 @@ sudo journalctl -u espresense-pi -b -1 --no-pager   # previous boot
 | --- | --- |
 | Companion's Nodes view shows `n/a` for Version/IP | The node isn't publishing `ver`/`ip` in its telemetry — check `mosquitto_sub -h 192.168.178.6 -v -t 'espresense/rooms/wohnzimmer/telemetry'` |
 | Companion's Nodes view shows `n/a` for CPU | Expected — Companion can only resolve the four ESP32 CPUs from the official firmware manifest (see above) |
+| Companion's **Visit** button opens a dead link | It always targets `http://<ip>` without a port — the web UI must listen on port 80 |
+| A device shows up twice in Companion, once per node type | An id mismatch between this node and the ESP32 nodes — compare `mosquitto_sub -h 192.168.178.6 -v -t 'espresense/devices/+/+'` |
+| A device is seen by the ESP32 nodes but flaps here | Usually missing calibration: without `rssi@1m` the node falls back to `ref_rssi`, which can put the device right at the `max_distance` edge |
 | HA shows the room **disconnected** but device messages keep arriving | Stale retained Last Will. The broker publishes `offline` only when it reaps the dead session, which can land *after* the client reconnected and published `online`. Fixed by re-asserting the retained `online` status on every telemetry tick — verify with `mosquitto_sub -h 192.168.178.6 -v -t 'espresense/rooms/wohnzimmer/status'` |
 | `MQTT disconnected rc=16` in the log | paho keepalive (30 s) timeout — a transient network hiccup or broker restart. Harmless if a reconnect line follows within seconds |
 | No devices detected at all | Adapter down or soft-blocked: `sudo rfkill unblock bluetooth && sudo hciconfig hci0 up` |
