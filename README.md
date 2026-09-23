@@ -115,6 +115,21 @@ unclutter -idle 0.5 &
 # shutdown or a hostname change) so kiosk startup never silently fails.
 rm -f ~/.config/chromium/Singleton{Lock,Cookie,Socket}
 
+# Wait for Home Assistant to actually be reachable before launching the
+# kiosk browser. Auto-login on tty1 (and thus startx/openbox/chromium) has
+# no dependency on network-online.target, so on a cold boot/reset it can
+# race Wi-Fi association + DHCP by several seconds. Chromium's --kiosk/--app
+# mode never auto-retries a failed load, so launching too early leaves the
+# panel stuck on a permanent "can't reach this page" error. Give the network
+# up to 60s, then launch regardless so the panel isn't blank forever if HA
+# is genuinely down.
+HA_HOST="192.168.178.11"
+HA_PORT="8123"
+for i in $(seq 1 60); do
+    curl -s -o /dev/null --max-time 2 "http://${HA_HOST}:${HA_PORT}/" && break
+    sleep 1
+done
+
 # Launch Chromium in kiosk mode
 # Replace YOUR_HOME_ASSISTANT_URL with the actual URL of your Lovelace dashboard
 # Example: http://homeassistant.local:8123/lovelace/main
@@ -260,6 +275,23 @@ EndSection
   `--noerrdialogs` hides the dialog so nothing visibly happens. Fix:
   `rm ~/.config/chromium/Singleton{Lock,Cookie,Socket}` then relaunch. The
   autostart script now does this automatically before every launch.
+- **After a power cycle/reset: Pi is up but no SSH, no espresense-pi web UI,
+  and Chromium shows a "can't reach this page" error**: this is a boot-order
+  race, not three separate failures. `getty@tty1` autologin (which chains
+  into `startx` → `openbox` → Chromium) has no dependency on
+  `network-online.target`, but Wi-Fi association + DHCP after a cold boot
+  can take several seconds. SSH and the espresense-pi web UI recover on
+  their own within a few seconds once the network is actually up (SSH binds
+  as soon as `sshd` starts; espresense-pi's systemd unit already waits on
+  `network-online.target`). Chromium's `--kiosk`/`--app` mode is the one
+  piece that doesn't self-heal: if it loads before the network is ready it
+  never retries and just sits on the error page indefinitely. The
+  `autostart` script now waits (up to 60s) for the Home Assistant host to
+  respond to an HTTP request before launching Chromium, which closes this
+  race. If it still happens, check `vcgencmd get_throttled` (undervoltage
+  can slow/disrupt Wi-Fi bring-up) and
+  `journalctl -b 0 -u NetworkManager -u wpa_supplicant` for how long
+  association actually took on that boot.
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
