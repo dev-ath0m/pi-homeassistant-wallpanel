@@ -41,8 +41,10 @@ flowchart TD
 ```bash
 sudo apt update
 sudo apt install -y xserver-xorg xinit x11-xserver-utils openbox \
-    chromium unclutter unclutter-startup
+    chromium unclutter unclutter-startup scrot xdotool
 ```
+
+(`scrot` and `xdotool` are only needed for the [kiosk watchdog](#5-kiosk-watchdog-auto-recovery), not for the kiosk itself.)
 
 ## 1. Auto-login on tty1
 
@@ -156,7 +158,73 @@ Notes specific to this hardware/setup:
 
 
 
-## 5. Special settings required for the display to work
+## 5. Kiosk watchdog (auto-recovery)
+
+Chromium's `--kiosk`/`--app` mode has no built-in recovery for two failure
+modes observed on this Pi:
+
+1. The process disappears entirely (crash, OOM-kill).
+2. The renderer **wedges** (JS/GPU deadlock) while the process stays alive
+   and the window keeps showing the last painted frame forever — no crash
+   dump is written, input (mouse/touch) does nothing, and nothing else
+   notices. This is what caused the panel to get stuck showing a frozen
+   clock/screensaver image for hours until manually restarted.
+
+A watchdog script + systemd timer checks for both every 10 minutes and
+restarts Chromium if needed.
+
+File: `~/bin/kiosk-watchdog.sh` (see the file for the full script) — the
+key logic:
+
+1. If no `chromium.*--kiosk` process exists, relaunch immediately.
+2. Otherwise take two screenshots ~65s apart (via `scrot`) and compare them
+   byte-for-byte. Since the dashboard always shows a live clock/screensaver,
+   an identical pair means rendering has stopped — kill and relaunch
+   Chromium (clearing the `Singleton*` lock files first, same as the normal
+   autostart).
+
+Systemd units:
+
+```bash
+sudo tee /etc/systemd/system/kiosk-watchdog.service >/dev/null <<'EOF'
+[Unit]
+Description=Kiosk watchdog - restart Chromium if hung or crashed
+After=graphical.target
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/home/pi/bin/kiosk-watchdog.sh
+EOF
+
+sudo tee /etc/systemd/system/kiosk-watchdog.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run kiosk watchdog periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now kiosk-watchdog.timer
+```
+
+Check it ran and what it decided:
+
+```bash
+systemctl list-timers kiosk-watchdog.timer
+sudo journalctl -u kiosk-watchdog.service -n 20
+```
+
+Note each run takes ~65s (the screenshot comparison window) — that's
+expected, not a hang.
+
+## 6. Special settings required for the display to work
 
 Beyond the kiosk scripts above, the following make the physical panel
 function at all. Everything here was already present/auto-detected on
@@ -241,21 +309,23 @@ EndSection
 
 1. Flash Raspberry Pi OS, enable SSH, set username `pi`, boot it.
 2. Install packages (see [Required packages](#required-packages)).
-3. Confirm the boot config lines in [section 5a](#a-boot-config-bootfirmwareconfigtxt)
+3. Confirm the boot config lines in [section 6a](#a-boot-config-bootfirmwareconfigtxt)
    are in `/boot/firmware/config.txt` (add if missing), reboot if changed.
 4. Confirm `pi` is in the `video` group and the backlight udev rule
-   ([section 5c](#c-backlight-write-permission-udev-rule)) exists — needed
+   ([section 6c](#c-backlight-write-permission-udev-rule)) exists — needed
    for the brightness line in the kiosk script to work without root.
 5. Create the getty autologin override (step 1) and reload systemd.
 6. Create `~/.bash_profile` (step 2).
 7. Create `~/.xinitrc` and `chmod +x` it (step 3).
 8. Create `~/.config/openbox/autostart`, `chmod +x` it, and edit the
    Chromium `--app=` URL to point at your Home Assistant dashboard (step 4).
-9. Check the backlight path (`ls /sys/class/backlight/`) and xrandr output
+9. Create `~/bin/kiosk-watchdog.sh` and the `kiosk-watchdog.service`/`.timer`
+   units (step 5) so a hung or crashed Chromium recovers on its own.
+10. Check the backlight path (`ls /sys/class/backlight/`) and xrandr output
    name (`DISPLAY=:0 xrandr`) match what's used in the autostart script;
    adjust if different. Also verify touch works correctly after the 180°
-   rotation ([section 5d](#d-touch-rotation--no-manual-calibration-configured)).
-10. Reboot: `sudo reboot`. The Pi should land directly on the kiosk.
+   rotation ([section 6d](#d-touch-rotation--no-manual-calibration-configured)).
+11. Reboot: `sudo reboot`. The Pi should land directly on the kiosk.
 
 ## Troubleshooting
 
@@ -292,6 +362,19 @@ EndSection
   can slow/disrupt Wi-Fi bring-up) and
   `journalctl -b 0 -u NetworkManager -u wpa_supplicant` for how long
   association actually took on that boot.
+- **Panel frozen on a static image/clock, doesn't update, and doesn't react
+  to touch**: the Chromium process is alive but its renderer has wedged (no
+  crash, so nothing auto-recovers). Confirm with a screenshot
+  (`DISPLAY=:0 XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1) scrot -o /tmp/x.png`)
+  taken a minute apart — if they're byte-identical
+  (`cmp -s shot1.png shot2.png`) and touch/mouse input does nothing, it's
+  hung. Fix immediately with `pkill -9 -f 'chromium.*--kiosk'` (the
+  [watchdog](#5-kiosk-watchdog-auto-recovery) will relaunch it within ~10
+  minutes on its own, or relaunch manually with the same
+  `chromium --kiosk --app=...` command). The `kiosk-watchdog.timer`
+  (section 5) exists specifically to catch this automatically going
+  forward — check `sudo journalctl -u kiosk-watchdog.service` to see
+  if/when it already did.
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
