@@ -193,6 +193,12 @@ After=graphical.target
 
 [Service]
 Type=oneshot
+# Without this, systemd kills every process in the unit's cgroup - including
+# the detached `setsid chromium ...` the script just launched - the instant
+# the script exits, since Type=oneshot units stop as soon as ExecStart
+# returns. That silently killed every relaunch attempt, leaving the screen
+# blank with just a cursor.
+KillMode=process
 User=pi
 ExecStart=/home/pi/bin/kiosk-watchdog.sh
 EOF
@@ -375,6 +381,17 @@ EndSection
   (section 5) exists specifically to catch this automatically going
   forward — check `sudo journalctl -u kiosk-watchdog.service` to see
   if/when it already did.
+- **Panel shows nothing but the mouse cursor (openbox/Xorg running, no
+  Chromium window)**: check `pgrep -af chromium` — if there's truly no
+  Chromium process, this was caused by a `kiosk-watchdog.service` bug: its
+  default `KillMode=control-group` made systemd kill the just-launched
+  Chromium the instant the oneshot script exited, every single time the
+  watchdog tried to relaunch it, so it could never survive. Fixed by adding
+  `KillMode=process` to `kiosk-watchdog.service` (see section 5) so systemd
+  only tracks the script itself, not the detached Chromium it spawns. If
+  `pgrep -af chromium` shows a process but the screen is still blank, that's
+  a different issue — check `journalctl -u kiosk-watchdog.service` and the
+  troubleshooting entries above instead.
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
