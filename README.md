@@ -41,10 +41,10 @@ flowchart TD
 ```bash
 sudo apt update
 sudo apt install -y xserver-xorg xinit x11-xserver-utils openbox \
-    chromium unclutter unclutter-startup scrot xdotool
+    chromium unclutter unclutter-startup scrot xdotool xinput
 ```
 
-(`scrot` and `xdotool` are only needed for the [kiosk watchdog](#5-kiosk-watchdog-auto-recovery), not for the kiosk itself.)
+(`scrot` and `xdotool` are only needed for the [kiosk watchdog](#5-kiosk-watchdog-auto-recovery), and `xinput` only for diagnosing/recalibrating touch input — none of the three are needed for the kiosk itself.)
 
 ## 1. Auto-login on tty1
 
@@ -290,17 +290,20 @@ sudo usermod -aG video pi
 
 (log out/reboot for the group change to take effect).
 
-### d. Touch rotation — no manual calibration configured
+### d. Touch rotation calibration
 
-There is currently **no** `xorg.conf.d` calibration matrix or `xinput`
-transform for the `ft5x06` touch device. Since the panel is rotated 180°
-via `xrandr` in the kiosk script, modern Xorg + libinput normally
-auto-syncs touch coordinates to match the rotated output automatically.
-If touch ever ends up inverted/offset after a fresh install, add a config
-like this to force it:
+The panel is rotated 180° via `xrandr --output DSI-1 --rotate inverted` in
+the kiosk script. libinput does **not** auto-sync touch coordinates to a
+rotated output — the `ft5x06` touch device reports raw (unrotated)
+coordinates, so without an explicit transform, touch ends up mirrored 180°
+from what's shown on screen (e.g. tapping the top-left corner hits the
+bottom-right). Confirm with `DISPLAY=:0 xinput list-props "10-0038 generic
+ft5x06 (79)"` — a `Coordinate Transformation Matrix` of the identity
+(`1 0 0 0 1 0 0 0 1`) means no transform is applied yet.
+
+File: `/etc/X11/xorg.conf.d/40-touch-rotate.conf`
 
 ```
-# /etc/X11/xorg.conf.d/40-touch-rotate.conf
 Section "InputClass"
     Identifier "touch-rotate"
     MatchProduct "generic ft5x06"
@@ -309,7 +312,21 @@ Section "InputClass"
 EndSection
 ```
 
-(the matrix above is a 180° rotation; adjust for a different orientation).
+The matrix above is a 180° rotation; adjust for a different orientation.
+This file only takes effect on the next X server start (device add time),
+not instantly. To apply it to the **current** session without restarting X
+(and without kicking the kiosk), set it live with `xinput` instead:
+
+```bash
+DISPLAY=:0 XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1) \
+    xinput set-prop "10-0038 generic ft5x06 (79)" \
+    "Coordinate Transformation Matrix" -1 0 1 0 -1 1 0 0 1
+```
+
+Do both: the `xinput set-prop` fixes the running session immediately, the
+`xorg.conf.d` file makes it survive the next reboot/X restart. The exact
+device name/path (`10-0038 generic ft5x06 (79)`) can shift on a fresh
+install — check with `DISPLAY=:0 xinput list`.
 
 ## Rebuilding from a blank SD card — step by step
 
