@@ -136,8 +136,17 @@ done
 # Launch Chromium in kiosk mode
 # Replace YOUR_HOME_ASSISTANT_URL with the actual URL of your Lovelace dashboard
 # Example: http://homeassistant.local:8123/lovelace/main
-chromium --noerrdialogs --disable-infobars --kiosk --force-dark-mode --app="http://192.168.178.11:8123/wallpanel-local/0?wp_enabled=true" &
+chromium --noerrdialogs --disable-infobars --kiosk --force-dark-mode --force-renderer-accessibility --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disk-cache-dir=/tmp/chromium-cache --disk-cache-size=104857600 --app="http://192.168.178.11:8123/wallpanel-local/0?wp_enabled=true" &
 ```
+
+The debug port is bound to localhost only; the watchdog uses it to read the
+screensaver boolean (section 5). Any local process can drive the browser
+through it, which is acceptable on this single-user kiosk.
+
+`--disk-cache-dir`/`--disk-cache-size` keep Chromium's HTTP cache in RAM
+(`/tmp` is a tmpfs) to spare the boot media; see
+[section 8](#8-reducing-writes-to-the-boot-media-usb-stick--sd-card). The
+watchdog's `relaunch()` must carry the same flags.
 
 Make sure it's executable: `chmod +x ~/.config/openbox/autostart`
 
@@ -178,11 +187,21 @@ File: `~/bin/kiosk-watchdog.sh` (see the file for the full script) — the
 key logic:
 
 1. If no `chromium.*--kiosk` process exists, relaunch immediately.
-2. Otherwise take two screenshots ~65s apart (via `scrot`) and compare them
-   byte-for-byte. Since the dashboard always shows a live clock/screensaver,
-   an identical pair means rendering has stopped — kill and relaunch
-   Chromium (clearing the `Singleton*` lock files first, same as the normal
-   autostart).
+2. Ask the page for `input_boolean.wallpanel_screensaver_local` via
+   `~/bin/kiosk-ha-state.py` (a stdlib-only script that evaluates one
+   expression over Chromium's localhost debug port, using the page's own HA
+   session, so no token is needed).
+   - `off`: HA motion control has the screensaver off, so the empty
+     dashboard (black screen) is expected. No action.
+   - No answer within 10s (checked twice, 20s apart): renderer is wedged,
+     relaunch.
+3. Boolean `on` (or unknown, e.g. debug port missing): take two screenshots
+   ~65s apart (via `scrot`) and compare them byte-for-byte. The slideshow
+   always moves, so an identical pair means rendering has stopped — kill and
+   relaunch Chromium (clearing the `Singleton*` lock files first, same as the
+   normal autostart). If the state is unknown and the frame is uniform
+   (PNG under 4 KB), it is not restarted, as it can't be told from
+   screensaver-off.
 
 Systemd units:
 
@@ -228,8 +247,13 @@ systemctl list-timers kiosk-watchdog.timer
 sudo journalctl -u kiosk-watchdog.service -n 20
 ```
 
-Note each run takes ~65s (the screenshot comparison window) — that's
+Note a run takes ~65s only when the boolean is on (the screenshot
+comparison window); with it off the run finishes immediately. That's
 expected, not a hang.
+
+While the boolean is off the black screen is intended, so the watchdog
+leaves it alone (see the troubleshooting entry about a black screen with a
+healthy Chromium).
 
 ## 6. Special settings required for the display to work
 
@@ -387,6 +411,140 @@ isolation with `chromium --force-renderer-accessibility --user-data-dir=/tmp/t
 kiosk instance via the Chromium single-instance lock) — onboard should pop
 up docked at the bottom within a second or two of the tap/click.
 
+## 8. Reducing writes to the boot media (USB stick / SD card)
+
+The OS runs from a USB stick, which wears out with constant small writes.
+The measures below move the heaviest writers to RAM. Already RAM-backed on
+this Pi (Raspberry Pi OS Trixie defaults): `/tmp` (tmpfs) and swap (zram), so
+nothing to do there. Verify with `mount | grep /tmp` and `swapon --show`.
+
+### a. Journal in RAM
+
+File: `/etc/systemd/journald.conf.d/volatile.conf`
+
+```ini
+[Journal]
+Storage=volatile
+RuntimeMaxUse=64M
+```
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/volatile.conf >/dev/null <<'EOF'
+[Journal]
+Storage=volatile
+RuntimeMaxUse=64M
+EOF
+sudo systemctl restart systemd-journald
+sudo rm -rf /var/log/journal   # drop the old persistent journal
+```
+
+Trade-off: `journalctl` history (including the watchdog's `logger` messages)
+is lost on every reboot, so a crash that caused a reboot leaves no log.
+Temporarily switch back to `Storage=persistent` when debugging boot problems.
+
+### b. Less frequent ext4 journal commits
+
+In `/etc/fstab`, add `commit=60` to the root mount options (default is 5 s):
+
+```
+PARTUUID=xxxxxxxx-02  /  ext4  defaults,noatime,commit=60  0  1
+```
+
+```bash
+sudo findmnt --verify          # must report 0 errors before rebooting
+sudo systemctl daemon-reload
+sudo mount -o remount /
+```
+
+Trade-off: a power cut can lose up to ~60 s of writes (the filesystem itself
+stays consistent).
+
+### c. Chromium cache in RAM
+
+Chromium's cache was the largest writer (~800 MB under `~/.cache/chromium`).
+The `--disk-cache-dir=/tmp/chromium-cache --disk-cache-size=104857600` flags
+(already in the autostart and watchdog launch lines) keep it in RAM, capped at
+100 MB. The profile in `~/.config/chromium` stays on disk on purpose, since it
+holds the Home Assistant login; clear any old on-disk cache once with
+`rm -rf ~/.cache/chromium/Default/Cache ~/.cache/chromium/Default/Code\ Cache`.
+
+### c2. zram swap without a backing file
+
+Raspberry Pi OS defaults to `zram+file`, where zram writes idle pages back to
+`/var/swap` (2 GB on the stick). With 4 GB RAM and this workload swap use is
+tiny, so use plain zram (takes effect after a reboot; check `swapon --show`):
+
+```bash
+sudo mkdir -p /etc/rpi/swap.conf.d
+printf '[Main]\nMechanism=zram\n' | sudo tee /etc/rpi/swap.conf.d/90-zram-only.conf
+```
+
+### d. Unneeded timers and apt cache files
+
+```bash
+sudo systemctl disable --now man-db.timer   # rebuilds the man page index
+
+# apt rewrites two ~70 MB binary cache files on every update
+printf 'Dir::Cache::pkgcache "";\nDir::Cache::srcpkgcache "";\n' | sudo tee /etc/apt/apt.conf.d/02nocache
+sudo rm -f /var/cache/apt/pkgcache.bin /var/cache/apt/srcpkgcache.bin
+```
+
+### Checking the result
+
+Per-process write totals since boot (run after the kiosk has been up a while):
+
+```bash
+for p in /proc/[0-9]*; do w=$(sudo awk '/^write_bytes/{print $2}' $p/io 2>/dev/null); \
+  [ -n "$w" ] && [ "$w" -gt 0 ] && echo "$w $(cat $p/comm)"; done | sort -rn | head
+```
+
+## 9. Power button and cooling fan (GPIO)
+
+Both are configured in `/boot/firmware/config.txt`:
+
+```ini
+dtoverlay=gpio-shutdown
+[all]
+dtoverlay=gpio-fan,gpiopin=14,temp=60000
+```
+
+### a. Shutdown button on GPIO3 (pin 5)
+
+- `gpio-shutdown` defaults to GPIO3, active-low with internal pull-up. Wire a
+  momentary switch between GPIO3 (pin 5) and ground (pin 6 or 9); no external
+  resistor.
+- The overlay registers an input device (`soc:shutdown_button@3`, `KEY_POWER`)
+  and `systemd-logind` handles it with `HandlePowerKey=poweroff`, so a press
+  gives a clean shutdown.
+- Pressing the same button while halted wakes the Pi 4, which needs
+  `WAKE_ON_GPIO=1` in the bootloader EEPROM (the default).
+- GPIO3 is also I2C1 SCL; this works only while `dtparam=i2c_arm` stays off.
+- Test: `sudo apt install evtest && sudo evtest /dev/input/event0` and press
+  the button (expect `KEY_POWER` press/release).
+
+### b. Fan on GPIO14 (pin 8)
+
+- The kernel `gpio-fan` driver switches the pin on above 60 °C
+  (`temp=60000`). `pinctrl get 14` should show an output while Linux runs.
+- GPIO14 is also the UART TX pin. With `BOOT_UART=1` in the bootloader
+  EEPROM, the firmware drives GPIO14 as UART while halted and during early
+  boot, and the idle-high TX line kept the fan running after shutdown. Fix:
+
+  ```bash
+  sudo rpi-eeprom-config > /tmp/boot.conf
+  sed -i 's/^BOOT_UART=1/BOOT_UART=0/' /tmp/boot.conf
+  sudo rpi-eeprom-config --apply /tmp/boot.conf
+  sudo reboot
+  ```
+
+  Verify with `sudo rpi-eeprom-config | grep UART` (expect `BOOT_UART=0`),
+  then `sudo poweroff` and check the fan stops.
+- Do not use `POWER_OFF_ON_HALT=1` to stop the fan: it needs
+  `WAKE_ON_GPIO=0`, which disables the button wake above.
+- If the fan still runs after halt, add a ~10 kΩ pull-down from GPIO14 to
+  ground, or move the fan to a non-UART pin and change `gpiopin=`.
+
 ## Rebuilding from a blank SD card — step by step
 
 1. Flash Raspberry Pi OS, enable SSH, set username `pi`, boot it.
@@ -409,10 +567,35 @@ up docked at the bottom within a second or two of the tap/click.
    rotation ([section 6d](#d-touch-rotation--no-manual-calibration-configured)).
 11. Set the onboard dconf keys and verify the on-screen keyboard pops up on
     text field focus ([section 7](#7-on-screen-keyboard-touch-text-input)).
-12. Reboot: `sudo reboot`. The Pi should land directly on the kiosk.
+12. If booting from a USB stick / SD card you want to preserve, apply the
+    write-reduction settings ([section 8](#8-reducing-writes-to-the-boot-media-usb-stick--sd-card)).
+13. Add the power button and fan overlays and set `BOOT_UART=0`
+    ([section 9](#9-power-button-and-cooling-fan-gpio)).
+14. Reboot: `sudo reboot`. The Pi should land directly on the kiosk.
 
 ## Troubleshooting
 
+- **Wi-Fi does not connect after boot, `nmcli con show` lists no Wi-Fi
+  profile**: after an unclean power-off, the Wi-Fi profile files
+  (`/etc/NetworkManager/system-connections/*.nmconnection`, and
+  `/etc/netplan/90-NM-*.yaml`) can be left as 0-byte files because the data
+  never reached the stick. Check with `sudo ls -l` on both directories,
+  delete the 0-byte files, and recreate the profile without putting the
+  password in shell history:
+
+  ```bash
+  read -rs -p "Wi-Fi password: " PW; echo
+  sudo nmcli con add type wifi ifname wlan0 con-name "AS Home Router" ssid "AS Home Router" \
+      wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$PW" connection.autoconnect yes
+  unset PW
+  sudo nmcli con up "AS Home Router"; sync
+  ```
+
+  `Error: 802-11-wireless-security.key-mgmt: property is missing` from
+  `nmcli dev wifi connect` leaves a half-created profile; use the command
+  above (or `nmcli con mod ... wifi-sec.key-mgmt wpa-psk`) instead. If the
+  log then shows `4way_handshake` followed by `no-secrets`, the stored
+  password is wrong. Run `sync` after any change to these files.
 - **Stuck at a login prompt / black screen**: check
   `systemctl status getty@tty1` and confirm the override file is in place
   (`systemctl cat getty@tty1`).
@@ -470,6 +653,16 @@ up docked at the bottom within a second or two of the tap/click.
   `pgrep -af chromium` shows a process but the screen is still blank, that's
   a different issue — check `journalctl -u kiosk-watchdog.service` and the
   troubleshooting entries above instead.
+- **Screen is uniformly black/dark grey (#111) but Chromium is running**: usually
+  not a fault. `wallpanel-local` has `idle_time: 0` and is driven by
+  `input_boolean.wallpanel_screensaver_local`, which HA motion control turns
+  on/off. While it is `off` the view underneath is an empty dashboard (no
+  cards), i.e. black, and the watchdog deliberately does nothing. Every fresh
+  Chromium start (boot, watchdog relaunch) also leaves the boolean `off`
+  until motion control turns it `on`. Check the state with
+  `~/bin/kiosk-ha-state.py` (prints `on`/`off`); if it is `on` and the screen
+  is still black or frozen, the watchdog will restart Chromium on its next
+  run (`sudo journalctl -t kiosk-watchdog`).
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
