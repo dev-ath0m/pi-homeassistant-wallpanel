@@ -33,7 +33,7 @@ flowchart TD
     B --> C[.bash_profile runs startx]
     C --> D[.xinitrc runs openbox-session]
     D --> E[openbox autostart script]
-    E --> F[Chromium --kiosk -> Home Assistant dashboard]
+    E --> F[Chromium --app window -> Home Assistant dashboard]
 ```
 
 ## Required packages
@@ -126,17 +126,17 @@ rm -f ~/.config/chromium/Singleton{Lock,Cookie,Socket}
 # panel stuck on a permanent "can't reach this page" error. Give the network
 # up to 60s, then launch regardless so the panel isn't blank forever if HA
 # is genuinely down.
-HA_HOST="192.168.178.11"
+HA_HOST="192.168.178.6"
 HA_PORT="8123"
 for i in $(seq 1 60); do
     curl -s -o /dev/null --max-time 2 "http://${HA_HOST}:${HA_PORT}/" && break
     sleep 1
 done
 
-# Launch Chromium in kiosk mode
+# Launch Chromium as a maximized app window (see rc.xml rule in section 7; --kiosk would make it WM-fullscreen and hide onboard)
 # Replace YOUR_HOME_ASSISTANT_URL with the actual URL of your Lovelace dashboard
 # Example: http://homeassistant.local:8123/lovelace/main
-chromium --noerrdialogs --disable-infobars --kiosk --force-dark-mode --force-renderer-accessibility --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disk-cache-dir=/tmp/chromium-cache --disk-cache-size=104857600 --app="http://192.168.178.11:8123/wallpanel-local/0?wp_enabled=true" &
+chromium --noerrdialogs --disable-infobars --force-dark-mode --force-renderer-accessibility --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disk-cache-dir=/tmp/chromium-cache --disk-cache-size=104857600 --app="http://192.168.178.6:8123/wallpanel-local/0?wp_enabled=true" &
 ```
 
 The debug port is bound to localhost only; the watchdog uses it to read the
@@ -162,7 +162,7 @@ Notes specific to this hardware/setup:
   `DISPLAY=:0 xrandr` if it doesn't match after a fresh install.
 - The dashboard URL points at a **WallPanel** view
   (`/wallpanel-local/0?wp_enabled=true`) on a Home Assistant instance at
-  `192.168.178.11:8123`. If that IP changes, update the URL here (using
+  `192.168.178.6:8123`. If that IP changes, update the URL here (using
   `homeassistant.local:8123` instead of a raw IP is more resilient to DHCP
   changes).
 
@@ -186,7 +186,7 @@ restarts Chromium if needed.
 File: `~/bin/kiosk-watchdog.sh` (see the file for the full script) — the
 key logic:
 
-1. If no `chromium.*--kiosk` process exists, relaunch immediately.
+1. If no `chromium.*--app=http` process exists, relaunch immediately.
 2. Ask the page for `input_boolean.wallpanel_screensaver_local` via
    `~/bin/kiosk-ha-state.py` (a stdlib-only script that evaluates one
    expression over Chromium's localhost debug port, using the page's own HA
@@ -195,6 +195,11 @@ key logic:
      dashboard (black screen) is expected. No action.
    - No answer within 10s (checked twice, 20s apart): renderer is wedged,
      relaunch.
+   - `on` but no slideshow image loaded (only the clock shows; see the
+     troubleshooting entry below), confirmed after 30s: reload the page
+     (`kiosk-ha-state.py --reload`, which also switches the boolean back on,
+     since WallPanel resets it to `off` on every load); if there is still no
+     image 30s later, relaunch Chromium.
 3. Boolean `on` (or unknown, e.g. debug port missing): take two screenshots
    ~65s apart (via `scrot`) and compare them byte-for-byte. The slideshow
    always moves, so an identical pair means rendering has stopped — kill and
@@ -391,10 +396,39 @@ onboard's auto-show/docking behavior is stored in `dconf`
 
 ```bash
 dconf write /org/onboard/auto-show/enabled true
+dconf write /org/onboard/auto-show/hide-on-key-press false
+dconf write /org/onboard/auto-show/reposition-method-docked "'none'"
+dconf write /org/onboard/auto-show/reposition-method-floating "'none'"
 dconf write /org/onboard/layout "'Phone'"
 dconf write /org/onboard/window/docking-enabled true
 dconf write /org/onboard/window/docking-edge "'bottom'"
 ```
+
+- `hide-on-key-press false`: by default any hardware key press (including the
+  PowerConf buttons) pauses auto-show for 30 minutes.
+- `reposition-method-* none`: otherwise onboard jumps to the top of the
+  screen and covers the page, since the docked keyboard shrinks the page.
+
+4. **Chromium must not be WM-fullscreen.** Openbox puts a focused fullscreen
+   window above every other window, including onboard, so with `--kiosk` the
+   keyboard was shown (AT-SPI events arrived, the window was mapped) but
+   hidden behind Chromium. Chromium is therefore started as a plain
+   `--app=` window (no `--kiosk`), and `~/.config/openbox/rc.xml` (copy of
+   `/etc/xdg/openbox/rc.xml`) has this rule at the end of `<applications>`:
+
+   ```xml
+   <application class="Chromium">
+     <decor>no</decor>
+     <maximized>yes</maximized>
+     <layer>normal</layer>
+   </application>
+   ```
+
+   The docked keyboard reserves screen space, so Chromium shrinks to 800x275
+   while it is shown and returns to full size when it hides. Apply changes
+   with `openbox --reconfigure`. Caveat: if WallPanel requests HTML
+   fullscreen (`fullscreen: true` in its config, only after a tap), the
+   window becomes WM-fullscreen again and covers the keyboard.
 
 Both the `dbus-send` call and `onboard &` are added to
 `~/.config/openbox/autostart` (before the Chromium launch line), and
@@ -602,7 +636,7 @@ dtoverlay=gpio-fan,gpiopin=14,temp=60000
 - **X fails to start**: run `startx` manually while logged in on tty1 to
   see the error output.
 - **Chromium doesn't show the dashboard**: test the URL from a regular
-  browser first, then run the `chromium --kiosk --app=...` command manually
+  browser first, then run the `chromium --app=...` command manually
   in a terminal (via SSH + `DISPLAY=:0`, plus
   `XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1)`) to see errors.
 - **Chromium silently never launches (no process at all, X/openbox fine)**:
@@ -635,10 +669,10 @@ dtoverlay=gpio-fan,gpiopin=14,temp=60000
   (`DISPLAY=:0 XAUTHORITY=$(ls -t /tmp/serverauth.* | head -1) scrot -o /tmp/x.png`)
   taken a minute apart — if they're byte-identical
   (`cmp -s shot1.png shot2.png`) and touch/mouse input does nothing, it's
-  hung. Fix immediately with `pkill -9 -f 'chromium.*--kiosk'` (the
+  hung. Fix immediately with `pkill -9 -f 'chromium.*--app=http'` (the
   [watchdog](#5-kiosk-watchdog-auto-recovery) will relaunch it within ~10
   minutes on its own, or relaunch manually with the same
-  `chromium --kiosk --app=...` command). The `kiosk-watchdog.timer`
+  `chromium --app=...` command). The `kiosk-watchdog.timer`
   (section 5) exists specifically to catch this automatically going
   forward — check `sudo journalctl -u kiosk-watchdog.service` to see
   if/when it already did.
@@ -663,6 +697,17 @@ dtoverlay=gpio-fan,gpiopin=14,temp=60000
   `~/bin/kiosk-ha-state.py` (prints `on`/`off`); if it is `on` and the screen
   is still black or frozen, the watchdog will restart Chromium on its next
   run (`sudo journalctl -t kiosk-watchdog`).
+- **Screensaver boolean is on but only the clock shows, no photos**: on page
+  load WallPanel fetches its media list once (`media-source://.../SlideshowFrame`)
+  and gives up after 3 retries, 3s apart. If the HA websocket drops in that
+  window (console: `Websocket died, forcing reconnect...`, `Failed to update
+  media list ... after 3 retries`; the Wi-Fi also roams between the router's
+  two BSSIDs a few times a day), the list stays empty until the page is
+  reloaded, every time the boolean turns on. `~/bin/kiosk-ha-state.py` prints
+  `on-noimage` in this state and the watchdog reloads the page. Manual fix:
+  `~/bin/kiosk-ha-state.py --reload`. Wi-Fi power save is switched off to
+  reduce such drops (`sudo nmcli con modify "AS Home Router"
+  802-11-wireless.powersave 2`; check with `iw dev wlan0 get power_save`).
 - **Screen not rotated / wrong output name**: run `DISPLAY=:0 xrandr`
   to list actual output names and adjust `--output DSI-1` accordingly.
 - **Backlight control does nothing**: run `ls /sys/class/backlight/` to
