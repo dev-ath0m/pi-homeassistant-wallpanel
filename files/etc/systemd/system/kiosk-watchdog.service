@@ -1,0 +1,9 @@
+[Unit]
+Description=Kiosk watchdog - restart Chromium if hung or crashed
+After=graphical.target
+
+[Service]
+Type=oneshot
+KillMode=process
+User=pi
+ExecStart=/home/pi/bin/kiosk-watchdog.sh

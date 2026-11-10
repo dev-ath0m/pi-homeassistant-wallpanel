@@ -579,6 +579,45 @@ dtoverlay=gpio-fan,gpiopin=14,temp=60000
 - If the fan still runs after halt, add a ~10 kΩ pull-down from GPIO14 to
   ground, or move the fan to a non-UART pin and change `gpiopin=`.
 
+## Files in this repository
+
+The `files/` folder holds a copy of every custom script, config file and
+systemd unit running on this Pi, laid out under the path it is installed at
+(so `files/etc/...` goes to `/etc/...`). No credentials are stored in it:
+Wi-Fi passwords and the Home Assistant login are never written to these files.
+Only private LAN IPs appear (`192.168.178.6` Home Assistant).
+
+| File in `files/` | Installed at | Purpose |
+| --- | --- | --- |
+| `home/pi/bin/kiosk-watchdog.sh` | `~/bin/` | Restarts Chromium if it is gone, hung or has no slideshow image (section 5) |
+| `home/pi/bin/kiosk-ha-state.py` | `~/bin/` | Reads the screensaver boolean over Chromium's local debug port; `--reload` reloads the page |
+| `home/pi/.config/openbox/autostart` | `~/.config/openbox/` | Backlight, rotation, onboard, waits for HA, launches Chromium (section 4) |
+| `home/pi/.config/openbox/rc.xml` | `~/.config/openbox/` | Default Openbox config plus the Chromium window rule and PowerConf key grabs |
+| `home/pi/.bash_profile` | `~/` | Starts X on tty1 |
+| `home/pi/.xinitrc` | `~/` | Starts `openbox-session` |
+| `etc/systemd/system/getty@tty1.service.d/autologin.conf` | `/etc/systemd/system/getty@tty1.service.d/` | Auto-login of `pi` on tty1 |
+| `etc/systemd/system/kiosk-watchdog.service`, `.timer` | `/etc/systemd/system/` | Runs the watchdog every 10 minutes |
+| `etc/systemd/system/wyoming-satellite.service` | `/etc/systemd/system/` | Voice satellite using the wake word service on the HA host ([setup](WYOMING_SATELLITE_SETUP.md)) |
+| `etc/systemd/system/wyoming-satellite.service.d/debug.conf` | `/etc/systemd/system/wyoming-satellite.service.d/` | Debug override of the satellite (same options plus `--debug`); delete it to turn debug logging off |
+| `opt/wyoming-satellite/snd-play.sh` | `/opt/wyoming-satellite/` | Plays satellite audio with a short silence first so the PowerConf wakes up |
+| `etc/systemd/system/glances.service` | `/etc/systemd/system/` | Glances web monitoring ([setup](GLANCES_SETUP.md)) |
+| `etc/systemd/system/cpu-governor.service` | `/etc/systemd/system/` | Sets the CPU governor to `powersave` at boot |
+| `etc/udev/rules.d/backlight.rules` | `/etc/udev/rules.d/` | Lets user `pi` write the backlight brightness (section 6c) |
+| `etc/X11/xorg.conf.d/40-touch-rotate.conf` | `/etc/X11/xorg.conf.d/` | Touch rotation matrix for the inverted panel (section 6d) |
+| `etc/systemd/journald.conf.d/volatile.conf` | `/etc/systemd/journald.conf.d/` | Journal in RAM (section 8a) |
+| `etc/apt/apt.conf.d/02nocache` | `/etc/apt/apt.conf.d/` | Stops apt writing its large cache files (section 8d) |
+| `etc/rpi/swap.conf.d/90-zram-only.conf` | `/etc/rpi/swap.conf.d/` | zram swap without a backing file (section 8c2) |
+
+The `espresense-pi` service has its own repository. The `/boot/firmware/config.txt`
+lines are listed in sections 6a and 9 instead of being copied, because the file
+is mostly OS defaults.
+
+To restore on a fresh install, copy the files to their install paths, then
+`chmod +x` the scripts, `sudo systemctl daemon-reload`, and enable the units
+(`sudo systemctl enable --now kiosk-watchdog.timer wyoming-satellite glances`).
+Edit the Home Assistant IP, the PowerConf card name and the wake word in them
+first if they differ.
+
 ## Rebuilding from a blank SD card — step by step
 
 1. Flash Raspberry Pi OS, enable SSH, set username `pi`, boot it.
