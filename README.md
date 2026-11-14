@@ -181,11 +181,17 @@ modes observed on this Pi:
    clock/screensaver image for hours until manually restarted.
 
 A watchdog script + systemd timer checks for both every 10 minutes and
-restarts Chromium if needed.
+restarts Chromium if needed. It also acts as a Wi-Fi backstop (step 0).
 
 File: `~/bin/kiosk-watchdog.sh` (see the file for the full script) — the
 key logic:
 
+0. Ping the default gateway. If unreachable, append a snapshot (device
+   state, last 15 min of NetworkManager/wpa_supplicant journal) to
+   `~/kiosk-network.log`, run `nmcli con up "AS Home Router"`, and if the
+   gateway is still down 20s later, `systemctl restart NetworkManager`. Uses
+   `sudo -n` (passwordless sudo for `pi`, the Raspberry Pi OS default). See
+   [Wi-Fi never reconnects](#troubleshooting).
 1. If no `chromium.*--app=http` process exists, relaunch immediately.
 2. Ask the page for `input_boolean.wallpanel_screensaver_local` via
    `~/bin/kiosk-ha-state.py` (a stdlib-only script that evaluates one
@@ -476,6 +482,11 @@ sudo rm -rf /var/log/journal   # drop the old persistent journal
 Trade-off: `journalctl` history (including the watchdog's `logger` messages)
 is lost on every reboot, so a crash that caused a reboot leaves no log.
 Temporarily switch back to `Storage=persistent` when debugging boot problems.
+To still keep Wi-Fi evidence across reboots, the NetworkManager dispatcher
+script `/etc/NetworkManager/dispatcher.d/90-wifi-event-log` appends
+wlan0 up/down/DHCP events to `/var/log/wifi-events.log` (a few lines per
+event), and the watchdog writes `~/kiosk-network.log` only when the gateway
+is unreachable.
 
 ### b. Less frequent ext4 journal commits
 
@@ -605,6 +616,7 @@ Only private LAN IPs appear (`192.168.178.6` Home Assistant).
 | `etc/udev/rules.d/backlight.rules` | `/etc/udev/rules.d/` | Lets user `pi` write the backlight brightness (section 6c) |
 | `etc/X11/xorg.conf.d/40-touch-rotate.conf` | `/etc/X11/xorg.conf.d/` | Touch rotation matrix for the inverted panel (section 6d) |
 | `etc/systemd/journald.conf.d/volatile.conf` | `/etc/systemd/journald.conf.d/` | Journal in RAM (section 8a) |
+| `etc/NetworkManager/dispatcher.d/90-wifi-event-log` | `/etc/NetworkManager/dispatcher.d/` (mode 755, root) | Logs wlan0 up/down events to `/var/log/wifi-events.log` (section 8a) |
 | `etc/apt/apt.conf.d/02nocache` | `/etc/apt/apt.conf.d/` | Stops apt writing its large cache files (section 8d) |
 | `etc/rpi/swap.conf.d/90-zram-only.conf` | `/etc/rpi/swap.conf.d/` | zram swap without a backing file (section 8c2) |
 
@@ -648,6 +660,16 @@ first if they differ.
 
 ## Troubleshooting
 
+- **Wi-Fi never reconnects after a router/AP outage (only a reboot helps)**:
+  by default NetworkManager stops auto-connecting after 4 failed attempts
+  (`connection.autoconnect-retries`), so an outage longer than that leaves
+  wlan0 down until reboot. The journal is volatile, so the evidence is gone
+  after the reboot (found 2026-11-14). Fixes in place: retries set to
+  infinite (`sudo nmcli con mod "AS Home Router" connection.autoconnect-retries 0`),
+  the watchdog's gateway check and recovery (section 5), and persistent
+  event logs (`/var/log/wifi-events.log`, `~/kiosk-network.log`). Related
+  noise: `bgscan simple: Failed to enable signal strength monitoring` in
+  the wpa_supplicant log is harmless.
 - **Wi-Fi does not connect after boot, `nmcli con show` lists no Wi-Fi
   profile**: after an unclean power-off, the Wi-Fi profile files
   (`/etc/NetworkManager/system-connections/*.nmconnection`, and

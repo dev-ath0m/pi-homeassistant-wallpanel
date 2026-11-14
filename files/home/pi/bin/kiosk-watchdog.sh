@@ -29,6 +29,39 @@ relaunch() {
     disown
 }
 
+NET_LOG="$HOME/kiosk-network.log"
+
+gateway_up() {
+    local gw
+    gw="$(ip route show default 2>/dev/null | awk '{print $3; exit}')"
+    [[ -n "$gw" ]] && ping -c 2 -W 2 "$gw" >/dev/null 2>&1
+}
+
+# Backstop for NetworkManager giving up after repeated failed Wi-Fi
+# reconnects (e.g. router down for a while). Escalates: re-activate the
+# connection, then restart NetworkManager. Snapshot goes to a disk file since
+# the journal is volatile.
+if ! gateway_up; then
+    {
+        echo "=== $(date -Is) gateway unreachable ==="
+        nmcli -t -f DEVICE,STATE,CONNECTION dev 2>&1
+        journalctl --no-pager --since "-15min" -u NetworkManager -u wpa_supplicant 2>&1 | tail -40
+    } >>"$NET_LOG"
+    logger -t "$LOG_TAG" "gateway unreachable, reactivating Wi-Fi"
+    sudo -n nmcli con up "AS Home Router" >>"$NET_LOG" 2>&1
+    sleep 20
+    if ! gateway_up; then
+        logger -t "$LOG_TAG" "still unreachable, restarting NetworkManager"
+        sudo -n systemctl restart NetworkManager >>"$NET_LOG" 2>&1
+        sleep 30
+    fi
+    if gateway_up; then
+        echo "=== $(date -Is) recovered ===" >>"$NET_LOG"
+    else
+        echo "=== $(date -Is) still down after recovery attempts ===" >>"$NET_LOG"
+    fi
+fi
+
 # onboard (on-screen keyboard) can also get killed/crash independently of
 # Chromium; relaunch it too so touch text input keeps working.
 if ! pgrep -x onboard >/dev/null; then
